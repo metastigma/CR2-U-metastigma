@@ -17,6 +17,19 @@ positions, formula constants, the tables `tools/gen_*.py` read out of the librar
 them.
 
 Licence: GPL-2.0-or-later (`LICENSE`); the bundled libraries keep their own (`THIRD_PARTY.md`).
+
+## Russian localization — status
+
+The released Russian localization linked below is for the **first game, *Chaos Rings* (2010), for iPad and PlayStation Vita**. It is **not** a release for *Chaos Rings II*.
+
+- [Chaos Rings (first game) — iPad release announcement](https://t.me/ChaosRingsRus/13)
+- [Chaos Rings (first game) — PS Vita release listing](https://4pda.to/forum/index.php?showtopic=771459&st=3280)
+- [4PDA — iPad release announcement](https://4pda.to/forum/index.php?showtopic=948934&st=1360)
+- [Telegram — Chaos Rings Rus](https://t.me/ChaosRingsRus)
+- [VK — Chaos Rings translation community](https://vk.com/club224211635)
+
+The Russian translation of *Chaos Rings II* is undergoing in-game testing and release preparation. No public *Chaos Rings II* localization release has been published yet.
+
 Not affiliated with or endorsed by Square Enix or Media.Vision.
 
 ## Quick start
