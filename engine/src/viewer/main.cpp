@@ -269,7 +269,13 @@ struct Viewer {
     // settings.ini in the profile folder: read at the start, written on each change (a capture
     // neither reads nor writes it); the command line's flags over them
     struct Settings {
-        int display = 0;          // 0 a window, 1 fullscreen (the display's own mode), 2 borderless (the desktop)
+        int display =
+#if defined(SDL_PLATFORM_ANDROID) || defined(SDL_PLATFORM_IOS)
+            2;
+#else
+            1;
+#endif
+        bool displayUserSet = false;
         int resolution = 0;       // kResolutions: 0 the window's own size
         bool vsync = true;
         int fps = 60;             // frames drawn a second at most (0: as many as the display takes)
@@ -302,12 +308,14 @@ struct Viewer {
         if (!f) return;
         char line[256];
         Settings& s = settings;
+        bool hadDisplayMarker = false;
         while (std::fgets(line, sizeof line, f)) {
             char key[64];
             int v = 0;
             if (std::sscanf(line, " %63[a-z_] = %d", key, &v) != 2) continue;
             const std::string k = key;
             if (k == "display") s.display = std::clamp(v, 0, 2);
+            else if (k == "display_user_set") s.displayUserSet = v != 0, hadDisplayMarker = true;
             else if (k == "resolution") s.resolution = std::clamp(v, 0, int(std::size(kResolutions)) - 1);
             else if (k == "vsync") s.vsync = v != 0;
             else if (k == "fps") s.fps = std::clamp(v, 0, 1000);
@@ -328,6 +336,16 @@ struct Viewer {
             else if (k == "battle_speed") s.battleSpeed = std::clamp(v, 1, 5);
         }
         std::fclose(f);
+        // Old CR2 settings have no marker. Preserve previously selected fullscreen modes;
+        // migrate the old default Window choice to the new desktop fullscreen default.
+        if (!hadDisplayMarker) s.displayUserSet = s.display != 0;
+        if (!s.displayUserSet) {
+#if defined(SDL_PLATFORM_ANDROID) || defined(SDL_PLATFORM_IOS)
+            s.display = 2;
+#else
+            s.display = 1;
+#endif
+        }
     }
     void saveSettings() const {
         if (!settingsPersist) return;
@@ -335,9 +353,9 @@ struct Viewer {
         char* serialized = nullptr;
         const Settings& s = settings;
         if (SDL_asprintf(&serialized, "# CR2-U: the options' Display & Graphics (the command line's flags go over these)\n"
-                        "display=%d\nresolution=%d\nvsync=%d\nfps=%d\nrenderer=%d\nupscaler=%d\nquality=%d\nsharpness=%d\n"
+                        "display=%d\ndisplay_user_set=%d\nresolution=%d\nvsync=%d\nfps=%d\nrenderer=%d\nupscaler=%d\nquality=%d\nsharpness=%d\n"
                         "msaa=%d\nanisotropy=%d\nsharp_textures=%d\nhd_textures=%d\nhd_models=%d\nsmooth_models=%d\npad_swap=%d\nfield_speed=%d\nbattle_speed=%d\n",
-                     s.display, s.resolution, s.vsync ? 1 : 0, s.fps, s.renderer, s.upscaler, s.quality, s.sharpness, s.msaa,
+                     s.display, s.displayUserSet ? 1 : 0, s.resolution, s.vsync ? 1 : 0, s.fps, s.renderer, s.upscaler, s.quality, s.sharpness, s.msaa,
                      s.anisotropy, s.sharpTextures ? 1 : 0, s.hdTextures ? 1 : 0, s.hdModels ? 1 : 0, s.smoothModels, s.padSwap ? 1 : 0, s.fieldSpeed,
                      s.battleSpeed) < 0 || !serialized) return;
         std::string text = serialized;
@@ -346,6 +364,59 @@ struct Viewer {
         if (!keepData.empty()) text += "data=" + keepData + "\n";
         std::string error;
         if (!crstorage::replaceFile(savePath(settingsFile()), text, &error)) SDL_Log("settings: %s", error.c_str());
+    }
+    // Apply Window / exclusive native fullscreen / borderless fullscreen.
+    void applyDisplay() {
+        if (!window) return;
+        const int display = std::clamp(settings.display, 0, 2);
+        const SDL_DisplayID screen = SDL_GetDisplayForWindow(window);
+        SDL_DisplayMode mode{};
+        const SDL_DisplayMode* requested = nullptr;
+        if (display == 1) {
+            int width = 0, height = 0;
+            float refreshRate = 0.0f;
+            if (const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(screen)) {
+                width = desktop->w; height = desktop->h; refreshRate = desktop->refresh_rate;
+            }
+            const bool found = width > 0 && height > 0 &&
+                SDL_GetClosestFullscreenDisplayMode(screen, width, height, refreshRate, true, &mode);
+            if (found && mode.w == width && mode.h == height) requested = &mode;
+            else SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "exclusive desktop mode %dx%d unavailable; using desktop fullscreen", width, height);
+        }
+        if (!SDL_SetWindowFullscreenMode(window, requested)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "setting fullscreen mode: %s", SDL_GetError());
+            requested = nullptr;
+            SDL_SetWindowFullscreenMode(window, nullptr);
+        }
+        if (display == 0) {
+            if (!SDL_SetWindowFullscreen(window, false))
+                SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "leaving fullscreen: %s", SDL_GetError());
+            SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        } else if (!SDL_SetWindowFullscreen(window, true)) {
+            SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "entering fullscreen: %s", SDL_GetError());
+            if (requested && SDL_SetWindowFullscreenMode(window, nullptr) && SDL_SetWindowFullscreen(window, true))
+                SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "exclusive fullscreen failed; using desktop fullscreen");
+        }
+        const bool hidden = (SDL_GetWindowFlags(window) & SDL_WINDOW_HIDDEN) != 0;
+        if (!hidden) {
+            SDL_SyncWindow(window);
+            bool fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+            if (display != 0 && !fullscreen) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "fullscreen request was not applied; retrying on visible window");
+                SDL_SetWindowFullscreen(window, true); SDL_SyncWindow(window);
+                fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+            }
+            if (display != 0 && !fullscreen) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "exclusive fullscreen was refused; trying desktop fullscreen");
+                SDL_SetWindowFullscreenMode(window, nullptr); SDL_SetWindowFullscreen(window, true); SDL_SyncWindow(window);
+                fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+            }
+            if (display != 0 && !fullscreen)
+                SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "window manager left the game windowed after fullscreen retries");
+            else if (display == 1 && fullscreen && !SDL_GetWindowFullscreenMode(window))
+                SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "fullscreen is desktop-borderless, not exclusive");
+        }
+        appliedDisplay = display;
     }
     // The settings onto the device, the window and the textures (each only as it changes)
     void applySettings() {
@@ -371,12 +442,7 @@ struct Viewer {
         // (an upscaler's scene is smaller: the mips its output would take - DLSS's and FSR's advice)
         tf.lodBias = upscale.mode != cr2::Upscaler::Off ? -std::log2(upscale.ratio) : 0.0f;
         dev->setFiltering(tf);
-        if (window && s.display != appliedDisplay) {
-            if (s.display == 1) SDL_SetWindowFullscreenMode(window, SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(window)));
-            else SDL_SetWindowFullscreenMode(window, nullptr);
-            SDL_SetWindowFullscreen(window, s.display != 0);
-            appliedDisplay = s.display;
-        }
+        if (window && s.display != appliedDisplay) applyDisplay();
         if (s.hdTextures != hdTextures) hdTextures = s.hdTextures, reloadTextures();
         if (!orientationApplied || appliedLock != s.lockOrientation || appliedFlip != s.landscapeFlipped) {
             mobile::orientation(window, s.lockOrientation, s.landscapeFlipped);
@@ -431,8 +497,8 @@ struct Viewer {
         };
         auto onOff = [](bool b) { return std::string(b ? "On" : "Off"); };
         static const char* const kDisplay[] = {"Window", "Fullscreen", "Borderless"};
-        rows.push_back({"Display", kDisplay[std::clamp(s.display, 0, 2)], "A window, fullscreen at the display's own mode, or borderless over the desktop",
-                        true, [&s](int d) { s.display = (s.display + d + 3) % 3; }});
+        rows.push_back({"Display", kDisplay[std::clamp(s.display, 0, 2)], "A window, exclusive fullscreen at the native display mode, or borderless over the desktop",
+                         true, [&s](int d) { s.display = (s.display + d + 3) % 3; s.displayUserSet = true; }});
         {
             const int r = std::clamp(s.resolution, 0, int(std::size(kResolutions)) - 1);
             const std::string v = s.resolution < 0 ? std::to_string(resW) + " x " + std::to_string(resH) // (--resolution's own)
@@ -12262,6 +12328,7 @@ int main(int argc, char** argv) {
     float drag[5] = {0, 0, 0, 0, 0};               // --drag x0,y0,x1,y1,s: then a finger's drag that long (the screen's fractions; held for the capture)
     bool tapAfter = false, mute = false, forceAudio = false;
     int hdArg = -1;        // --hd-textures / --no-hd-textures (-1: the settings')
+    int displayArg = -1;
     int speedArg[2] = {0, 0}; // --field-speed / --battle-speed n (0: the settings')
     int smoothArg = -1;       // --smooth-models 0 | 2 | 3 (-1: the settings')
     bool hdModelsArg = false; // --hd-models (on whatever the settings say)
@@ -12382,6 +12449,9 @@ int main(int argc, char** argv) {
         else if (a == "--game-save" && next) gameSavePath = next, ++i; // (--play from the game's own game.dat / cont.dat)
         else if (a == "--title") titleScreen = true;
         else if (a == "--resolution" && next) std::sscanf(next, "%dx%d", &resW, &resH), ++i;
+        else if (a == "--windowed") displayArg = 0;
+        else if (a == "--fullscreen") displayArg = 1;
+        else if (a == "--borderless") displayArg = 2;
         else if (a == "--upscaler" && next) upscaler = next, ++i;
         else if (a == "--quality" && next) quality = next, ++i;
         else if (a == "--fps" && next) fps = std::clamp(std::atoi(next), 0, 1000), ++i;
@@ -12480,6 +12550,7 @@ int main(int argc, char** argv) {
         if (capture.empty() && !exportTextures && !exportModels && exploreDir.empty()) {
             v.settingsPersist = true;
             v.loadSettings();
+            if (displayArg >= 0) s.display = displayArg;
             if (!given("--page")) page = 0; // (played: a page and a yes / no wait for the player, as the game's - --page n turns them by themselves)
             if (!given("--renderer")) renderer = s.renderer ? "opengl" : "vulkan";
             if (!given("--fps")) fps = s.fps;
@@ -12651,7 +12722,10 @@ int main(int argc, char** argv) {
     cr2::useBundledVulkan(); // (macOS: the .app's own loader)
     std::unique_ptr<cr2::RenderDevice> dev;
     SDL_Window* win = nullptr;
-    const SDL_WindowFlags shown = capture.empty() && exploreDir.empty() ? SDL_WINDOW_RESIZABLE : SDL_WINDOW_HIDDEN;
+    SDL_WindowFlags shown = SDL_WINDOW_HIDDEN;
+#if defined(SDL_PLATFORM_ANDROID) || defined(SDL_PLATFORM_IOS)
+    if (capture.empty() && exploreDir.empty()) shown = SDL_WINDOW_RESIZABLE;
+#endif
     for (const cr2::Backend b : {cr2::Backend::Vulkan, cr2::Backend::OpenGL}) {
         if (b == cr2::Backend::Vulkan && renderer != "vulkan") continue;
         std::unique_ptr<cr2::RenderDevice> d = b == cr2::Backend::Vulkan ? cr2::makeVkDevice() : cr2::makeGlDevice();
@@ -12961,6 +13035,21 @@ int main(int argc, char** argv) {
         if (v.hdTextures) SDL_Log("hd textures: %d replaced, %d without one (%s)", v.hdLoaded, v.hdMissing, v.hdDir.c_str());
         code = ok ? 0 : 1;
     } else {
+        if (!SDL_ShowWindow(win))
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "showing game window: %s", SDL_GetError());
+        if (!SDL_SyncWindow(win))
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "waiting for initial window state: %s", SDL_GetError());
+        v.appliedDisplay = -1;
+        v.applyDisplay();
+        if (SDL_getenv("CR_VIDEO_DEBUG")) {
+            const bool fullscreen = (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) != 0;
+            const char* mode = !fullscreen ? "windowed" :
+                               SDL_GetWindowFullscreenMode(win) ? "exclusive fullscreen" : "borderless fullscreen";
+            int w = 0, h = 0, pw = 0, ph = 0;
+            SDL_GetWindowSize(win, &w, &h); SDL_GetWindowSizeInPixels(win, &pw, &ph);
+            std::fprintf(stderr, "video: startup %s, window %dx%d points, %dx%d pixels, driver %s\\n",
+                         mode, w, h, pw, ph, SDL_GetCurrentVideoDriver());
+        }
         bool running = true, dragging = false;
         // A controller, as the Vita's buttons (its own code - docs/CONTROLS.md): by position, ○ the right
         // button and × the bottom one (the settings' Swap ○ and × the other way); its presses as the
@@ -13087,6 +13176,15 @@ int main(int argc, char** argv) {
                 else if (e.type == SDL_EVENT_KEY_DOWN) {
                     // (Android's Back: the menus' back, as Backspace)
                     const SDL_Keycode k = e.key.key == SDLK_AC_BACK ? SDLK_BACKSPACE : e.key.key;
+                    if (k == SDLK_F11 && !e.key.repeat) {
+                        const int savedDisplay = v.settings.display;
+                        const int temporaryDisplay = (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) ? 0 : 1;
+                        v.settings.display = temporaryDisplay;
+                        v.applyDisplay();
+                        v.settings.display = savedDisplay;
+                        v.appliedDisplay = temporaryDisplay;
+                        continue;
+                    }
                     if (k == SDLK_ESCAPE) running = false;
                     if (k == SDLK_SPACE) v.paused = !v.paused;
                     // F1: the next resolution; F2: the upscaler's next mode (off, FSR 3.1 native
