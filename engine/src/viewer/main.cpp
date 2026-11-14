@@ -12981,6 +12981,40 @@ int main(int argc, char** argv) {
         auto consumeInputCancel = [&] {
             if (v.consumeInputCancel(inputCancel)) dragging = false, padDir = 0, padDirNext = 0;
         };
+        auto closePad = [&] {
+            if (!pad) return;
+            SDL_CloseGamepad(pad);
+            pad = nullptr;
+            padDir = 0;
+            padDirNext = 0;
+        };
+        auto refreshPad = [&](SDL_JoystickID preferredId, bool reportFailure) {
+            SDL_JoystickID selectedId = preferredId;
+            if (selectedId == 0) {
+                if (pad && SDL_GamepadConnected(pad)) return;
+                int count = 0;
+                SDL_JoystickID* devices = SDL_GetGamepads(&count);
+                if (!devices) {
+                    if (reportFailure) SDL_LogWarn(SDL_LOG_CATEGORY_INPUT, "controller: SDL_GetGamepads failed: %s", SDL_GetError());
+                    return;
+                }
+                if (count > 0) selectedId = devices[0];
+                SDL_free(devices);
+            }
+            if (selectedId == 0) {
+                if (reportFailure) SDL_Log("controller: no mapped gamepads currently available");
+                return;
+            }
+            if (pad && SDL_GamepadConnected(pad) && SDL_GetGamepadID(pad) == selectedId) return;
+            SDL_Gamepad* candidate = SDL_OpenGamepad(selectedId);
+            if (!candidate) {
+                if (reportFailure) SDL_LogWarn(SDL_LOG_CATEGORY_INPUT, "controller: could not open gamepad %u: %s", unsigned(selectedId), SDL_GetError());
+                return;
+            }
+            if (pad) closePad();
+            pad = candidate;
+            SDL_Log("controller: %s (instance %u)", SDL_GetGamepadName(pad), unsigned(SDL_GetGamepadID(pad)));
+        };
         auto pushKey = [](SDL_Keycode key) {
             SDL_Event k{};
             k.type = SDL_EVENT_KEY_DOWN;
@@ -13190,9 +13224,12 @@ int main(int argc, char** argv) {
                     if ((k == SDLK_UP || k == SDLK_DOWN) && !f.anims.empty())
                         v.loadAnim(f, (f.animIndex + (k == SDLK_DOWN ? 1 : f.anims.size() - 1)) % f.anims.size());
                 } else if (e.type == SDL_EVENT_GAMEPAD_ADDED) {
-                    if (!pad && (pad = SDL_OpenGamepad(e.gdevice.which))) SDL_Log("controller: %s", SDL_GetGamepadName(pad));
+                    refreshPad(e.gdevice.which, true);
                 } else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) {
-                    if (pad && SDL_GetGamepadID(pad) == e.gdevice.which) SDL_CloseGamepad(pad), pad = nullptr, padDir = 0;
+                    if (pad && SDL_GetGamepadID(pad) == e.gdevice.which) {
+                        closePad();
+                        refreshPad(0, false);
+                    }
                 } else if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && pad) {
                     const SDL_GamepadButton b = SDL_GamepadButton(e.gbutton.button);
                     const SDL_GamepadButton circle = v.settings.padSwap ? SDL_GAMEPAD_BUTTON_SOUTH : SDL_GAMEPAD_BUTTON_EAST;
